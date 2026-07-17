@@ -1,0 +1,3 @@
+# Dev / CI only — not installed in production (render uses requirements.txt)
+pytest>=8.0.0
+ruff>=0.6.0

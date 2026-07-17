@@ -1,67 +1,187 @@
 """OnchainLens — Token Security Audit API
 
-A2MCP-compatible endpoint for real-time token security scanning.
-Accepts a contract address + chain, returns a structured risk report.
+Production-grade token security scanning for EVM chains (via GoPlus Security)
+and Solana (via RugCheck). Returns a structured, scored risk report.
+
+Endpoints
+  POST /audit   — audit a token contract (chain + address)
+  GET  /health  — liveness probe
+  GET  /        — service info
+
+Environment (all optional)
+  GOPLUS_API_KEY   Bearer token for GoPlus (lifts rate limits)
+  API_BEARER_TOKEN If set, /audit requires `Authorization: Bearer <token>`
+  CORS_ORIGINS     Comma-separated allowed origins (default: * public, no creds)
+  CACHE_TTL        Upstream response cache TTL in seconds (default: 120)
+  RATE_LIMIT       Max /audit requests per IP per 60s (default: 60, 0 = off)
+  LOG_LEVEL        logging level (default: INFO)
+  PORT             overridden by the platform at startup
 """
 
-import asyncio
+from __future__ import annotations
+
+import logging
 import os
-from typing import Optional
+import re
+import secrets
+import threading
+import time
+from contextlib import asynccontextmanager
+from typing import Any, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from datetime import datetime, timezone
 
-app = FastAPI(
-    title="OnchainLens",
-    description="Token Security Audit API — honeypot, ownership, and liquidity checks",
-    version="1.0.0",
+VERSION = "1.1.0"
+
+# ── Configuration (env-driven) ───────────────────────────────────────────────
+GOPLUS_API_KEY = os.getenv("GOPLUS_API_KEY")
+API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
+CACHE_TTL = int(os.getenv("CACHE_TTL", "120"))
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "60"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s [onchainlens] %(message)s",
 )
+logger = logging.getLogger("onchainlens")
 
-# ── Chain mapping ──────────────────────────────────────────────────────────
+GOPLUS_URL = "https://api.gopluslabs.io/api/v1/token_security"
+RUGCHECK_URL = "https://api.rugcheck.xyz/v1/tokens"
+
+# ── Chain mapping ────────────────────────────────────────────────────────────
+# EVM chains map to GoPlus numeric chain ids; "solana" is a sentinel handled
+# separately (GoPlus does NOT support Solana — RugCheck is used instead).
 CHAIN_IDS: dict[str, str] = {
-    "ethereum": "1",
-    "eth": "1",
-    "1": "1",
-    "bsc": "56",
-    "binance": "56",
-    "56": "56",
-    "polygon": "137",
-    "matic": "137",
-    "137": "137",
-    "arbitrum": "42161",
-    "arb": "42161",
-    "42161": "42161",
-    "optimism": "10",
-    "op": "10",
-    "10": "10",
-    "avalanche": "43114",
-    "avax": "43114",
-    "43114": "43114",
-    "base": "8453",
-    "8453": "8453",
-    "fantom": "250",
-    "ftm": "250",
-    "250": "250",
-    "solana": "solana",
-    "sol": "solana",
+    "ethereum": "1", "eth": "1", "1": "1",
+    "bsc": "56", "binance": "56", "56": "56",
+    "polygon": "137", "matic": "137", "137": "137",
+    "arbitrum": "42161", "arb": "42161", "42161": "42161",
+    "optimism": "10", "op": "10", "10": "10",
+    "avalanche": "43114", "avax": "43114", "43114": "43114",
+    "base": "8453", "8453": "8453",
+    "fantom": "250", "ftm": "250", "250": "250",
+    "solana": "solana", "sol": "solana",
 }
 
-# ── Models ──────────────────────────────────────────────────────────────────
+EVM_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+# Solana addresses are base58 (no 0,O,I,l) and 32-44 chars.
+SOLANA_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+# ── Shared HTTP client (lifespan-managed) ────────────────────────────────────
+HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global HTTP_CLIENT
+    HTTP_CLIENT = httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0),
+        headers={"User-Agent": f"OnchainLens/{VERSION}"},
+    )
+    logger.info(
+        "OnchainLens %s starting | goplus_key=%s rugcheck=on auth=%s cors=%s cache_ttl=%ss rate_limit=%s",
+        VERSION,
+        "set" if GOPLUS_API_KEY else "unset",
+        "on" if API_BEARER_TOKEN else "off",
+        CORS_ORIGINS,
+        CACHE_TTL,
+        RATE_LIMIT,
+    )
+    yield
+    if HTTP_CLIENT is not None:
+        await HTTP_CLIENT.aclose()
+        HTTP_CLIENT = None
+
+
+def get_client() -> httpx.AsyncClient:
+    if HTTP_CLIENT is None:
+        # Defensive fallback (e.g. tests) — should not happen in normal runtime.
+        return httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+    return HTTP_CLIENT
+
+
+# ── In-memory TTL cache ───────────────────────────────────────────────────────
+_cache: dict[str, tuple[float, Any]] = {}
+_cache_lock = threading.Lock()
+
+
+async def cache_get(key: str) -> Optional[Any]:
+    with _cache_lock:
+        item = _cache.get(key)
+        if item and item[0] > time.time():
+            return item[1]
+        _cache.pop(key, None)
+    return None
+
+
+async def cache_set(key: str, value: Any, ttl: int) -> None:
+    with _cache_lock:
+        _cache[key] = (time.time() + ttl, value)
+
+
+# ── In-memory per-IP rate limiter (fixed window) ─────────────────────────────
+_rl: dict[str, list[float]] = {}
+_rl_lock = threading.Lock()
+
+
+def rate_limit(request: Request) -> None:
+    if RATE_LIMIT <= 0:
+        return
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    with _rl_lock:
+        hits = _rl.get(ip, [])
+        hits = [t for t in hits if now - t < 60]
+        if len(hits) >= RATE_LIMIT:
+            _rl[ip] = hits
+            logger.warning("Rate limit hit for %s", ip)
+            raise HTTPException(429, "Rate limit exceeded. Please retry later.")
+        hits.append(now)
+        _rl[ip] = hits
+
+
+# ── Auth dependency ───────────────────────────────────────────────────────────
+def require_auth(request: Request) -> None:
+    if not API_BEARER_TOKEN:
+        return  # open mode
+    auth = request.headers.get("Authorization", "")
+    expected = f"Bearer {API_BEARER_TOKEN}"
+    if not secrets.compare_digest(auth, expected):
+        raise HTTPException(401, "Invalid or missing API token.")
+
+
+# ── Custom upstream errors ─────────────────────────────────────────────────────
+class UpstreamError(Exception):
+    def __init__(self, message: str, status_code: int = 502):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+class TokenNotFoundError(Exception):
+    pass
+
+
+# ── Pydantic models ─────────────────────────────────────────────────────────────
 class AuditRequest(BaseModel):
     contract_address: str = Field(
-        ..., description="Token contract address to audit (0x... for EVM, base58 for Solana)"
+        ..., description="Token contract address (0x... for EVM, base58 for Solana)"
     )
     chain: str = Field(
         default="ethereum",
-        description="Chain name or ID (ethereum, bsc, polygon, arbitrum, optimism, base, avalanche, solana)",
+        description="Chain name or id: ethereum, bsc, polygon, arbitrum, optimism, "
+                    "base, avalanche, fantom, solana",
     )
 
 
 class AuditFinding(BaseModel):
-    severity: str  # "critical", "high", "medium", "low", "info"
+    severity: str  # critical | high | medium | low | info
     title: str
     description: str
 
@@ -69,83 +189,153 @@ class AuditFinding(BaseModel):
 class AuditResponse(BaseModel):
     contract_address: str
     chain: str
+    provider: str  # source of the scan: "goplus" | "rugcheck"
     token_name: Optional[str] = None
     token_symbol: Optional[str] = None
     risk_score: int = Field(..., ge=0, le=100, description="0 = safe, 100 = extreme risk")
-    risk_level: str  # "SAFE", "LOW", "MEDIUM", "HIGH", "CRITICAL"
+    risk_level: str  # SAFE | LOW | MEDIUM | HIGH | CRITICAL
     is_honeypot: bool
     buy_tax: Optional[str] = None
     sell_tax: Optional[str] = None
-    is_open_source: bool = False
-    owner_renounced: bool = False
-    has_proxy: bool = False
+    is_open_source: Optional[bool] = None
+    owner_renounced: Optional[bool] = False
+    has_proxy: Optional[bool] = False
     liquidity_locked: Optional[bool] = None
+    liquidity_locked_pct: Optional[float] = None
     findings: list[AuditFinding] = []
     scan_timestamp: str
 
 
-# ── GoPlus integration ──────────────────────────────────────────────────────
-
-GOPLUS_URL = "https://api.gopluslabs.io/api/v1/token_security"
-
-
+# ── Upstream scanners ───────────────────────────────────────────────────────────
 async def scan_goplus(chain_id: str, address: str) -> dict:
-    """Query GoPlus Security API (free tier, no key needed)."""
+    """Query GoPlus token_security. Raises TokenNotFoundError / UpstreamError."""
+    client = get_client()
     url = f"{GOPLUS_URL}/{chain_id}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(url, params={"contract_addresses": address})
-        resp.raise_for_status()
+    headers = {"Authorization": f"Bearer {GOPLUS_API_KEY}"} if GOPLUS_API_KEY else {}
+    try:
+        resp = await client.get(
+            url, params={"contract_addresses": address}, headers=headers, timeout=30.0
+        )
+    except httpx.TimeoutException:
+        raise UpstreamError("GoPlus request timed out", 504)
+    except httpx.HTTPStatusError as e:
+        raise UpstreamError(f"GoPlus returned HTTP {e.response.status_code}", 502)
+    except httpx.RequestError as e:
+        raise UpstreamError(f"GoPlus unreachable: {e}", 502)
+
+    if resp.status_code != 200:
+        raise UpstreamError(f"GoPlus returned HTTP {resp.status_code}", 502)
+
+    try:
         data = resp.json()
-        if data.get("code") != 1:
-            raise HTTPException(502, f"GoPlus scan failed: {data.get('message', 'unknown error')}")
-        result = data.get("result", {})
-        address_lower = address.lower()
-        return result.get(address_lower, result.get(address, {}))
+    except ValueError:
+        raise UpstreamError("GoPlus returned non-JSON response", 502)
+
+    if data.get("code") != 1:
+        raise UpstreamError(f"GoPlus error: {data.get('message', 'unknown')}")
+
+    result = data.get("result")
+    if not result:
+        raise TokenNotFoundError(
+            f"Token {address} was not found or is not indexed by GoPlus Security."
+        )
+
+    addr_lower = address.lower()
+    token = result.get(addr_lower, result.get(address))
+    if not isinstance(token, dict):
+        raise TokenNotFoundError(
+            f"Token {address} was not found or is not indexed by GoPlus Security."
+        )
+    return token
 
 
-async def scan_solana(address: str) -> dict:
-    """Basic Solana token check via public APIs."""
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            resp = await client.get(
-                "https://public-api.solscan.io/token/meta",
-                params={"tokenAddress": address},
-            )
-            if resp.status_code == 200:
-                meta = resp.json()
-                return {
-                    "token_name": meta.get("name", ""),
-                    "token_symbol": meta.get("symbol", ""),
-                    "is_open_source": True,
-                    "owner_renounced": False,
-                    "is_honeypot": False,
-                }
-        except Exception:
-            pass
-    return {}
+async def scan_rugcheck(address: str) -> dict:
+    """Query RugCheck full report for a Solana mint. Raises TokenNotFoundError / UpstreamError."""
+    client = get_client()
+    url = f"{RUGCHECK_URL}/{address}/report"
+    try:
+        resp = await client.get(url, timeout=20.0)
+    except httpx.TimeoutException:
+        raise UpstreamError("RugCheck request timed out", 504)
+    except httpx.HTTPStatusError as e:
+        raise UpstreamError(f"RugCheck returned HTTP {e.response.status_code}", 502)
+    except httpx.RequestError as e:
+        raise UpstreamError(f"RugCheck unreachable: {e}", 502)
+
+    if resp.status_code == 404:
+        raise TokenNotFoundError(
+            f"Token {address} was not found or has not been scanned by RugCheck."
+        )
+    if resp.status_code == 429:
+        raise UpstreamError("RugCheck rate limit exceeded", 429)
+    if resp.status_code != 200:
+        raise UpstreamError(f"RugCheck returned HTTP {resp.status_code}", 502)
+
+    try:
+        data = resp.json()
+    except ValueError:
+        raise UpstreamError("RugCheck returned non-JSON response", 502)
+    if not isinstance(data, dict):
+        raise UpstreamError("RugCheck returned an unexpected response", 502)
+    return data
 
 
-def assess_risk(goplus_result: dict) -> tuple[int, str, bool, list[AuditFinding]]:
-    """Convert GoPlus results into a structured risk report."""
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def _truthy(v: Any) -> bool:
+    return v in ("1", 1, True, "true", "True")
+
+
+def _tax_str(raw: Any) -> Optional[str]:
+    if raw in (None, "", "0", 0, "0.0"):
+        return None
+    try:
+        return f"{float(raw)}%"
+    except (TypeError, ValueError):
+        return str(raw)
+
+
+def _risk_level(score: int) -> str:
+    if score >= 60:
+        return "CRITICAL"
+    if score >= 35:
+        return "HIGH"
+    if score >= 15:
+        return "MEDIUM"
+    if score >= 5:
+        return "LOW"
+    return "SAFE"
+
+
+# ── Risk assessment: GoPlus (EVM) ──────────────────────────────────────────────
+def assess_goplus(tok: dict) -> dict:
     findings: list[AuditFinding] = []
     risk = 0
 
-    is_honeypot_raw = goplus_result.get("is_honeypot", "0")
-    is_honeypot = is_honeypot_raw in ("1", 1, True)
-
+    is_honeypot = _truthy(tok.get("is_honeypot"))
     if is_honeypot:
         findings.append(AuditFinding(
             severity="critical",
             title="Honeypot Detected",
             description="This token prevents selling. Buyers cannot transfer or sell tokens after purchase.",
         ))
-        return 100, "CRITICAL", True, findings
+        return {
+            "token_name": tok.get("token_name") or None,
+            "token_symbol": tok.get("token_symbol") or None,
+            "risk_score": 100,
+            "risk_level": "CRITICAL",
+            "is_honeypot": True,
+            "buy_tax": _tax_str(tok.get("buy_tax")),
+            "sell_tax": _tax_str(tok.get("sell_tax")),
+            "is_open_source": _truthy(tok.get("is_open_source")),
+            "owner_renounced": _truthy(tok.get("is_renounced")),
+            "has_proxy": _truthy(tok.get("is_proxy")),
+            "liquidity_locked": None,
+            "liquidity_locked_pct": None,
+            "findings": findings,
+        }
 
-    # Buy / sell tax
-    buy_tax_str = goplus_result.get("buy_tax", "0")
-    sell_tax_str = goplus_result.get("sell_tax", "0")
-    buy_tax = float(buy_tax_str) if buy_tax_str else 0
-    sell_tax = float(sell_tax_str) if sell_tax_str else 0
+    buy_tax = float(tok.get("buy_tax") or 0) or 0.0
+    sell_tax = float(tok.get("sell_tax") or 0) or 0.0
 
     if sell_tax > 50:
         findings.append(AuditFinding(
@@ -177,21 +367,16 @@ def assess_risk(goplus_result: dict) -> tuple[int, str, bool, list[AuditFinding]
         ))
         risk += 10
 
-    # Ownership
-    is_renounced = goplus_result.get("is_renounced", "0") in ("1", 1, True)
-    if not is_renounced:
-        owner = goplus_result.get("owner_address", "")
-        if owner and owner != "0x0000000000000000000000000000000000000000":
-            findings.append(AuditFinding(
-                severity="medium",
-                title="Ownership Not Renounced",
-                description=f"Owner ({owner[:10]}...) retains control — they can modify the contract.",
-            ))
-            risk += 15
+    owner = tok.get("owner_address", "")
+    if not _truthy(tok.get("is_renounced")) and owner and owner != "0x0000000000000000000000000000000000000000":
+        findings.append(AuditFinding(
+            severity="medium",
+            title="Ownership Not Renounced",
+            description=f"Owner ({owner[:10]}...) retains control — they can modify the contract.",
+        ))
+        risk += 15
 
-    # Proxy
-    is_proxy = goplus_result.get("is_proxy", "0") in ("1", 1, True)
-    if is_proxy:
+    if _truthy(tok.get("is_proxy")):
         findings.append(AuditFinding(
             severity="low",
             title="Proxy Contract",
@@ -199,9 +384,7 @@ def assess_risk(goplus_result: dict) -> tuple[int, str, bool, list[AuditFinding]
         ))
         risk += 5
 
-    # Open source
-    is_open = goplus_result.get("is_open_source", "0") in ("1", 1, True)
-    if not is_open:
+    if not _truthy(tok.get("is_open_source")):
         findings.append(AuditFinding(
             severity="low",
             title="Closed Source",
@@ -209,12 +392,20 @@ def assess_risk(goplus_result: dict) -> tuple[int, str, bool, list[AuditFinding]
         ))
         risk += 10
 
-    # Liquidity
-    is_lp_locked = goplus_result.get("lp_holders") or goplus_result.get("is_in_dex", "0") in ("1", 1, True)
+    # Liquidity lock: only claim a value when we have real evidence.
+    lp_holders = tok.get("lp_holders")
+    lp_locked: Optional[bool] = None
+    if isinstance(lp_holders, list):
+        lp_locked = any(h.get("is_locked") == 1 for h in lp_holders)
+        if lp_locked is False:
+            findings.append(AuditFinding(
+                severity="medium",
+                title="Liquidity Not Locked",
+                description="LP holder data shows liquidity is not locked — rug-pull risk.",
+            ))
+            risk += 15
 
-    # Transfer pausable
-    can_pause = goplus_result.get("transfer_pausable", "0") in ("1", 1, True)
-    if can_pause:
+    if _truthy(tok.get("transfer_pausable")):
         findings.append(AuditFinding(
             severity="high",
             title="Transfer Can Be Paused",
@@ -222,9 +413,7 @@ def assess_risk(goplus_result: dict) -> tuple[int, str, bool, list[AuditFinding]
         ))
         risk += 20
 
-    # Mint function
-    can_mint = goplus_result.get("is_mintable", "0") in ("1", 1, True)
-    if can_mint and not is_renounced:
+    if _truthy(tok.get("is_mintable")) and not _truthy(tok.get("is_renounced")):
         findings.append(AuditFinding(
             severity="medium",
             title="Mintable Token",
@@ -232,9 +421,7 @@ def assess_risk(goplus_result: dict) -> tuple[int, str, bool, list[AuditFinding]
         ))
         risk += 10
 
-    # Blacklist
-    can_blacklist = goplus_result.get("is_blacklisted", "0") in ("1", 1, True)
-    if can_blacklist:
+    if _truthy(tok.get("is_blacklisted")):
         findings.append(AuditFinding(
             severity="high",
             title="Blacklist Function",
@@ -244,17 +431,6 @@ def assess_risk(goplus_result: dict) -> tuple[int, str, bool, list[AuditFinding]
 
     risk = min(risk, 95)
 
-    if risk >= 60:
-        level = "CRITICAL"
-    elif risk >= 35:
-        level = "HIGH"
-    elif risk >= 15:
-        level = "MEDIUM"
-    elif risk >= 5:
-        level = "LOW"
-    else:
-        level = "SAFE"
-
     if not findings:
         findings.append(AuditFinding(
             severity="info",
@@ -262,79 +438,274 @@ def assess_risk(goplus_result: dict) -> tuple[int, str, bool, list[AuditFinding]
             description="GoPlus reports no known vulnerabilities for this token.",
         ))
 
-    return risk, level, is_honeypot, findings
+    return {
+        "token_name": tok.get("token_name") or None,
+        "token_symbol": tok.get("token_symbol") or None,
+        "risk_score": risk,
+        "risk_level": _risk_level(risk),
+        "is_honeypot": False,
+        "buy_tax": _tax_str(tok.get("buy_tax")),
+        "sell_tax": _tax_str(tok.get("sell_tax")),
+        "is_open_source": _truthy(tok.get("is_open_source")),
+        "owner_renounced": _truthy(tok.get("is_renounced")),
+        "has_proxy": _truthy(tok.get("is_proxy")),
+        "liquidity_locked": lp_locked,
+        "liquidity_locked_pct": None,
+        "findings": findings,
+    }
 
 
-# ── Routes ──────────────────────────────────────────────────────────────────
+# ── Risk assessment: RugCheck (Solana) ─────────────────────────────────────────
+def _sev_from_level(level: Any, text: str) -> str:
+    t = (text or "").lower()
+    if isinstance(level, str):
+        lvl = level.lower()
+        if lvl in ("danger", "critical", "high"):
+            return "high"
+        if lvl in ("warn", "warning", "medium"):
+            return "medium"
+        if lvl in ("info", "low"):
+            return "low"
+    if isinstance(level, (int, float)):
+        if level >= 4:
+            return "high"
+        if level == 3:
+            return "medium"
+        if level <= 2:
+            return "low"
+    # Keyword fallback (RugCheck level semantics not formally documented).
+    if any(k in t for k in ("honeypot", "rugged", "freeze authority", "mint authority", "owner")):
+        return "high"
+    return "medium"
+
+
+def assess_rugcheck(report: dict, address: str) -> dict:
+    findings: list[AuditFinding] = []
+    score_risk = 0  # only genuinely-risky signals feed the numeric score
+
+    try:
+        score_norm = float(report.get("score_normalised") or report.get("score") or 0)
+    except (TypeError, ValueError):
+        score_norm = 0.0
+
+    rugged = bool(report.get("rugged"))
+    is_honeypot = rugged or any(
+        "honeypot" in str(r.get("name", "") + r.get("desc", "") + r.get("description", "")).lower()
+        for r in (report.get("risks") or [])
+    )
+
+    if rugged:
+        findings.append(AuditFinding(
+            severity="critical",
+            title="Rugged / Abandoned",
+            description="This token has been flagged as rugged or abandoned.",
+        ))
+        score_risk += 60
+
+    # RugCheck's own risk items feed both the findings list and the score.
+    _sev_weight = {"critical": 25, "high": 20, "medium": 10, "low": 5, "info": 0}
+    for r in (report.get("risks") or []):
+        name = r.get("name") or r.get("title") or "Risk detected"
+        desc = r.get("desc") or r.get("description") or ""
+        sev = _sev_from_level(r.get("level"), name + " " + desc)
+        findings.append(AuditFinding(severity=sev, title=str(name), description=str(desc)))
+        score_risk += _sev_weight.get(sev, 10)
+
+    # Informational authority/feature findings. These are standard on Solana
+    # (USDC itself has them) so they are SHOWN but NOT scored — RugCheck already
+    # accounts for them in score_normalised.
+    mint_auth = report.get("mintAuthority")
+    freeze_auth = report.get("freezeAuthority")
+    if mint_auth:
+        findings.append(AuditFinding(
+            severity="low",
+            title="Mint Authority Enabled",
+            description="The mint authority is still active — new tokens can be minted. Common on legitimate tokens but can be abused.",
+        ))
+    if freeze_auth:
+        findings.append(AuditFinding(
+            severity="low",
+            title="Freeze Authority Enabled",
+            description="The freeze authority is still active — holder accounts can be frozen. Common on legitimate tokens but can be abused.",
+        ))
+
+    lp_pct = report.get("lpLockedPct")
+    liquidity_locked: Optional[bool] = None
+    if isinstance(lp_pct, (int, float)):
+        liquidity_locked = lp_pct >= 80
+        if lp_pct < 50:
+            findings.append(AuditFinding(
+                severity="high",
+                title="Liquidity Mostly Unlocked",
+                description=f"Only {lp_pct:.1f}% of liquidity is locked.",
+            ))
+            score_risk += 20
+        elif lp_pct < 80:
+            findings.append(AuditFinding(
+                severity="medium",
+                title="Partial Liquidity Lock",
+                description=f"{lp_pct:.1f}% of liquidity is locked.",
+            ))
+            score_risk += 10
+
+    if report.get("transferFee"):
+        findings.append(AuditFinding(
+            severity="low",
+            title="Transfer Fee Present",
+            description=f"Token charges a transfer fee: {report.get('transferFee')}",
+        ))
+
+    # Holder concentration (best-effort — shape varies across tokens).
+    try:
+        top = (report.get("topHolders") or [])[:1]
+        if top:
+            raw = top[0].get("pct") or top[0].get("percentage") or top[0].get("percent")
+            if raw is not None:
+                pct = float(raw)
+                if pct <= 1:
+                    pct *= 100
+                if pct > 50:
+                    findings.append(AuditFinding(
+                        severity="high",
+                        title="Holder Concentration",
+                        description=f"The top holder controls {pct:.1f}% of supply.",
+                    ))
+                    score_risk += 20
+    except (TypeError, ValueError):
+        pass
+
+    # Final score: RugCheck's own normalized risk (authoritative) takes
+    # precedence, with our computed signal as a floor so genuinely-risky tokens
+    # with a stale/zero upstream score are still flagged.
+    risk_score = max(int(round(score_norm)), min(score_risk, 100))
+
+    if not findings:
+        findings.append(AuditFinding(
+            severity="info",
+            title="No Issues Found",
+            description="RugCheck reports no known risks for this token.",
+        ))
+
+    return {
+        "token_name": (report.get("tokenMeta") or {}).get("name") if isinstance(report.get("tokenMeta"), dict) else None,
+        "token_symbol": (report.get("tokenMeta") or {}).get("symbol") if isinstance(report.get("tokenMeta"), dict) else None,
+        "risk_score": risk_score,
+        "risk_level": _risk_level(risk_score),
+        "is_honeypot": is_honeypot,
+        "buy_tax": None,
+        "sell_tax": None,
+        "is_open_source": None,
+        "owner_renounced": mint_auth is None,
+        "has_proxy": None,
+        "liquidity_locked": liquidity_locked,
+        "liquidity_locked_pct": float(lp_pct) if isinstance(lp_pct, (int, float)) else None,
+        "findings": findings,
+    }
+
+
+# ── App ────────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="OnchainLens",
+    description="Token Security Audit API — honeypot, ownership, liquidity and authority checks for EVM & Solana.",
+    version=VERSION,
+    lifespan=lifespan,
+)
+
+allow_origins = ["*"] if CORS_ORIGINS.strip() == "*" else [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+if CORS_ORIGINS.strip() == "*":
+    logger.warning("CORS is open to all origins (*). Set CORS_ORIGINS for production.")
+
+
+@app.get("/")
+async def root():
+    return {
+        "service": "OnchainLens",
+        "version": VERSION,
+        "endpoints": {
+            "audit": "POST /audit  (body: {contract_address, chain})",
+            "health": "GET /health",
+            "docs": "/docs",
+        },
+    }
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "OnchainLens", "version": "1.0.0"}
+    return {"status": "ok", "service": "OnchainLens", "version": VERSION}
 
 
 @app.post("/audit", response_model=AuditResponse)
-async def audit_token(req: AuditRequest):
-    """Audit a token contract for security risks."""
-    import datetime
-
+async def audit_token(
+    req: AuditRequest,
+    request: Request,
+    _rl: None = Depends(rate_limit),
+    _auth: None = Depends(require_auth),
+):
     address = req.contract_address.strip()
     chain_key = req.chain.strip().lower()
 
     if chain_key not in CHAIN_IDS:
-        raise HTTPException(
-            400,
-            f"Unsupported chain: '{req.chain}'. Supported: {', '.join(sorted(set(k for k in CHAIN_IDS if not k.isdigit())))}",
-        )
+        supported = sorted({k for k in CHAIN_IDS if not k.isdigit() and k != "sol"})
+        raise HTTPException(400, f"Unsupported chain: '{req.chain}'. Supported: {', '.join(supported)}")
 
     chain_id = CHAIN_IDS[chain_key]
+    is_solana = chain_id == "solana"
 
-    if chain_id == "solana":
-        sol_data = await scan_solana(address)
-        risk_score = 5
-        risk_level = "LOW"
-        is_honeypot = False
-        findings = [
-            AuditFinding(
-                severity="info",
-                title="Solana — Limited Scan",
-                description="Solana audit is basic (meta-only). Full analysis coming soon.",
-            )
-        ]
-        buy_tax = None
-        sell_tax = None
-        is_open = sol_data.get("is_open_source", False)
-        is_renounced = sol_data.get("owner_renounced", False)
-        has_proxy = False
-        lp_locked = None
-        token_name = sol_data.get("token_name")
-        token_symbol = sol_data.get("token_symbol")
+    if is_solana:
+        if not SOLANA_RE.match(address):
+            raise HTTPException(400, "Invalid Solana address format.")
+        provider = "rugcheck"
     else:
-        goplus = await scan_goplus(chain_id, address)
-        risk_score, risk_level, is_honeypot, findings = assess_risk(goplus)
-        buy_tax = goplus.get("buy_tax", "0") + "%" if goplus.get("buy_tax") else None
-        sell_tax = goplus.get("sell_tax", "0") + "%" if goplus.get("sell_tax") else None
-        is_open = goplus.get("is_open_source", "0") in ("1", 1, True)
-        is_renounced = goplus.get("is_renounced", "0") in ("1", 1, True)
-        has_proxy = goplus.get("is_proxy", "0") in ("1", 1, True)
-        lp_locked = goplus.get("lp_holders") is not None or goplus.get("is_in_dex", "0") in ("1", 1, True)
-        token_name = goplus.get("token_name", "")
-        token_symbol = goplus.get("token_symbol", "")
+        if not EVM_RE.match(address):
+            raise HTTPException(400, "Invalid EVM address format (expected 0x + 40 hex chars).")
+        provider = "goplus"
+
+    cache_key = f"{provider}:{chain_id}:{address.lower()}"
+    cached = await cache_get(cache_key)
+    upstream_ms = None
+
+    if cached is not None:
+        logger.info("cache HIT %s %s", provider, address)
+        raw = cached
+    else:
+        start = time.time()
+        try:
+            raw = await (scan_rugcheck(address) if is_solana else scan_goplus(chain_id, address))
+        except TokenNotFoundError as e:
+            logger.info("not found %s %s", provider, address)
+            raise HTTPException(404, str(e))
+        except UpstreamError as e:
+            logger.error("upstream error %s %s: %s", provider, address, e.message)
+            raise HTTPException(e.status_code, e.message)
+        upstream_ms = int((time.time() - start) * 1000)
+        await cache_set(cache_key, raw, CACHE_TTL)
+        logger.info("scan %s %s -> %sms", provider, address, upstream_ms)
+
+    norm = assess_rugcheck(raw, address) if is_solana else assess_goplus(raw)
 
     return AuditResponse(
         contract_address=address,
         chain=req.chain,
-        token_name=token_name or None,
-        token_symbol=token_symbol or None,
-        risk_score=risk_score,
-        risk_level=risk_level,
-        is_honeypot=is_honeypot,
-        buy_tax=buy_tax,
-        sell_tax=sell_tax,
-        is_open_source=is_open,
-        owner_renounced=is_renounced,
-        has_proxy=has_proxy,
-        liquidity_locked=lp_locked,
-        findings=findings,
-        scan_timestamp=datetime.datetime.utcnow().isoformat() + "Z",
+        provider=provider,
+        token_name=norm["token_name"],
+        token_symbol=norm["token_symbol"],
+        risk_score=norm["risk_score"],
+        risk_level=norm["risk_level"],
+        is_honeypot=norm["is_honeypot"],
+        buy_tax=norm["buy_tax"],
+        sell_tax=norm["sell_tax"],
+        is_open_source=norm["is_open_source"],
+        owner_renounced=norm["owner_renounced"],
+        has_proxy=norm["has_proxy"],
+        liquidity_locked=norm["liquidity_locked"],
+        liquidity_locked_pct=norm["liquidity_locked_pct"],
+        findings=norm["findings"],
+        scan_timestamp=datetime.now(timezone.utc).isoformat(),
     )
