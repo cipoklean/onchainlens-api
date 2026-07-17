@@ -66,6 +66,11 @@ All optional. Copy `.env.example` to `.env` for local dev.
 | `CACHE_TTL`        | `120`   | Upstream cache TTL (seconds).                               |
 | `RATE_LIMIT`       | `60`    | Max `/audit` requests per IP / 60s (`0` disables).          |
 | `LOG_LEVEL`        | `INFO`  | Logging verbosity.                                          |
+| `OKX_API_KEY`      | unset   | OKX Developer Portal API key — enables x402 paid `/audit`. |
+| `OKX_SECRET_KEY`   | unset   | OKX API secret (paired with `OKX_API_KEY`).                |
+| `OKX_PASSPHRASE`   | unset   | OKX API passphrase (paired with `OKX_API_KEY`).            |
+| `X402_PAY_TO`      | Agentic Wallet | x402 recipient X Layer address (where USDT0 is paid).  |
+| `X402_PRICE`       | `$0.20` | Price per `/audit` call, e.g. `$0.20` (= 0.2 USDT0).       |
 
 ## Run locally
 
@@ -84,13 +89,27 @@ pytest
 
 Upstream calls are mocked, so the suite runs offline.
 
-## Deploy (Render)
+## Deploy (Vercel)
 
-1. Push to GitHub.
-2. Create a new **Web Service** on Render, link the repo, and use the included
-   `render.yaml` (Python runtime, auto-deploy). Set any of the env vars above in
-   the Render dashboard if desired.
-3. `healthCheckPath: /health` is configured for free-tier health checks.
+1. Push to GitHub and import the repo at vercel.com (Hobby/Free, no card).
+2. Build: `pip install -r requirements.txt`; start: `uvicorn main:app --host 0.0.0.0 --port $PORT`.
+3. For paid mode, add `OKX_API_KEY` / `OKX_SECRET_KEY` / `OKX_PASSPHRASE` (from the
+   OKX Developer Portal) in the Vercel project env vars.
+4. Auto-deploy on push. `GET /health` is the health probe.
+
+## Paid mode (x402 / OKX A2MCP)
+
+When `OKX_API_KEY` + `OKX_SECRET_KEY` + `OKX_PASSPHRASE` are set, `POST /audit`
+becomes an **x402** endpoint. An unpaying caller receives `HTTP 402` with a
+`PAYMENT-REQUIRED` challenge; after paying **0.2 USDT0** on X Layer (gas-free,
+scheme `exact`, `network: eip155:196`), the request is replayed and served.
+
+- Settlement asset: `USD₮0` (`0x779ded0c9e1022225f8e0630b35a9b54be713736`)
+- Recipient (`payTo`): the Agentic Wallet X Layer address (override via `X402_PAY_TO`)
+- Price: `X402_PRICE` (default `$0.20` → `200000` base units)
+- With no OKX key set, `/audit` stays **free** (graceful fallback).
+
+Powered by `okxweb3-app-x402` (OKX-branded Coinbase x402 SDK — Alpha).
 
 ## A2MCP / agent marketplace
 

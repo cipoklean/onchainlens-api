@@ -16,6 +16,9 @@ Environment (all optional)
   RATE_LIMIT       Max /audit requests per IP per 60s (default: 60, 0 = off)
   LOG_LEVEL        logging level (default: INFO)
   PORT             overridden by the platform at startup
+  OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSPHRASE  OKX Developer Portal key — enables x402 paid /audit
+  X402_PAY_TO      x402 recipient X Layer address (default: Agentic Wallet)
+  X402_PRICE       x402 price per call, e.g. "$0.20" (default: "$0.20" = 0.2 USDT0)
 """
 
 from __future__ import annotations
@@ -618,6 +621,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["X-RateLimit-Remaining", "Retry-After", "PAYMENT-REQUIRED"],
 )
 if CORS_ORIGINS.strip() == "*":
     logger.warning("CORS is open to all origins (*). Set CORS_ORIGINS for production.")
@@ -709,3 +713,65 @@ async def audit_token(
         findings=norm["findings"],
         scan_timestamp=datetime.now(timezone.utc).isoformat(),
     )
+
+
+# ── x402 pay-per-call (OKX A2MCP paid mode) ──────────────────────────────────
+# When OKX facilitator credentials are present, POST /audit becomes an x402
+# endpoint: a caller with no payment gets HTTP 402 + a PAYMENT-REQUIRED challenge;
+# after paying (USDT0 on X Layer, gas-free), the request is replayed and served.
+# Requires: pip install okxweb3-app-x402[evm,fastapi]  (OKX-branded Coinbase x402 SDK, Alpha)
+# Env: OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE  (OKX Developer Portal API key)
+#      X402_PAY_TO   (default: Agentic Wallet X Layer address)
+#      X402_PRICE    (default: "$0.20" = 0.2 USDT0 per call)
+OKX_API_KEY = os.getenv("OKX_API_KEY")
+OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY")
+OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
+X402_PAY_TO = os.getenv("X402_PAY_TO", "0x0441b018dca870938a4f2d1acc679cd9a47fd787")
+X402_PRICE = os.getenv("X402_PRICE", "$0.20")
+
+if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
+    try:
+        from x402.server import x402ResourceServer
+        from x402.http.okx_facilitator_client import OKXFacilitatorClient
+        from x402.http import (
+            OKXFacilitatorConfig,
+            OKXAuthConfig,
+            RouteConfig,
+            PaymentOption,
+        )
+        from x402.http.middleware.fastapi import payment_middleware
+        from x402.mechanisms.evm.exact.server import ExactEvmScheme
+
+        _facilitator = OKXFacilitatorClient(
+            OKXFacilitatorConfig(
+                auth=OKXAuthConfig(
+                    api_key=OKX_API_KEY,
+                    secret_key=OKX_SECRET_KEY,
+                    passphrase=OKX_PASSPHRASE,
+                ),
+                base_url="https://web3.okx.com",
+            )
+        )
+        _resource_server = x402ResourceServer(_facilitator)
+        _resource_server.register("eip155:196", ExactEvmScheme())
+        _routes = {
+            "POST /audit": RouteConfig(
+                accepts=[
+                    PaymentOption(
+                        scheme="exact",
+                        network="eip155:196",
+                        pay_to=X402_PAY_TO,
+                        price=X402_PRICE,
+                        max_timeout_seconds=300,
+                    )
+                ],
+                description="OnchainLens Token Security Audit (EVM + Solana)",
+                mime_type="application/json",
+            )
+        }
+        app.middleware("http")(payment_middleware(routes=_routes, server=_resource_server))
+        logger.info("x402 paid mode ENABLED for POST /audit @ %s/call (X Layer USDT0)", X402_PRICE)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.exception("x402 init failed; /audit remains free: %s", e)
+else:
+    logger.info("x402 paid mode DISABLED (set OKX_API_KEY/OKX_SECRET_KEY/OKX_PASSPHRASE to enable). /audit is free.")
