@@ -69,7 +69,7 @@ All optional. Copy `.env.example` to `.env` for local dev.
 | `OKX_API_KEY`      | unset   | OKX Developer Portal API key — enables x402 paid `/audit`. |
 | `OKX_SECRET_KEY`   | unset   | OKX API secret (paired with `OKX_API_KEY`).                |
 | `OKX_PASSPHRASE`   | unset   | OKX API passphrase (paired with `OKX_API_KEY`).            |
-| `X402_PAY_TO`      | Agentic Wallet | x402 recipient X Layer address (where USDT0 is paid).  |
+| `X402_PAY_TO`      | 0xf5fbbf…59c4 | x402 recipient X Layer address (your wallet; where USDT0 is paid). |
 | `X402_PRICE`       | `$0.20` | Price per `/audit` call, e.g. `$0.20` (= 0.2 USDT0).       |
 
 ## Run locally
@@ -105,7 +105,7 @@ becomes an **x402** endpoint. An unpaying caller receives `HTTP 402` with a
 scheme `exact`, `network: eip155:196`), the request is replayed and served.
 
 - Settlement asset: `USD₮0` (`0x779ded0c9e1022225f8e0630b35a9b54be713736`)
-- Recipient (`payTo`): the Agentic Wallet X Layer address (override via `X402_PAY_TO`)
+- Recipient (`payTo`): your EVM wallet (default 0xf5fbbf…59c4; override via `X402_PAY_TO`)
 - Price: `X402_PRICE` (default `$0.20` → `200000` base units)
 - With no OKX key set, `/audit` stays **free** (graceful fallback).
 

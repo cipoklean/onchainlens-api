@@ -17,7 +17,7 @@ Environment (all optional)
   LOG_LEVEL        logging level (default: INFO)
   PORT             overridden by the platform at startup
   OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSPHRASE  OKX Developer Portal key — enables x402 paid /audit
-  X402_PAY_TO      x402 recipient X Layer address (default: Agentic Wallet)
+  X402_PAY_TO      x402 recipient X Layer address (default: your EVM wallet)
   X402_PRICE       x402 price per call, e.g. "$0.20" (default: "$0.20" = 0.2 USDT0)
 """
 
@@ -721,12 +721,12 @@ async def audit_token(
 # after paying (USDT0 on X Layer, gas-free), the request is replayed and served.
 # Requires: pip install okxweb3-app-x402[evm,fastapi]  (OKX-branded Coinbase x402 SDK, Alpha)
 # Env: OKX_API_KEY, OKX_SECRET_KEY, OKX_PASSPHRASE  (OKX Developer Portal API key)
-#      X402_PAY_TO   (default: Agentic Wallet X Layer address)
+#      X402_PAY_TO   (default: your EVM wallet)
 #      X402_PRICE    (default: "$0.20" = 0.2 USDT0 per call)
 OKX_API_KEY = os.getenv("OKX_API_KEY")
 OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY")
 OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
-X402_PAY_TO = os.getenv("X402_PAY_TO", "0x0441b018dca870938a4f2d1acc679cd9a47fd787")
+X402_PAY_TO = os.getenv("X402_PAY_TO", "0xf5fbbf435ecc12542992db5c9e14e117a90059c4")
 X402_PRICE = os.getenv("X402_PRICE", "$0.20")
 
 if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
