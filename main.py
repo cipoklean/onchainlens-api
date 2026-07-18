@@ -23,6 +23,7 @@ Environment (all optional)
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import re
@@ -33,7 +34,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from datetime import datetime, timezone
@@ -645,6 +646,29 @@ async def health():
     return {"status": "ok", "service": "OnchainLens", "version": VERSION}
 
 
+@app.get("/audit")
+async def audit_info():
+    """Public, unauthenticated info about the /audit endpoint.
+
+    Lets reachability probes (GET/HEAD) see a 200 instead of 405, and tells
+    callers how to use the paid POST endpoint.
+    """
+    return {
+        "service": "OnchainLens",
+        "endpoint": "POST /audit",
+        "description": (
+            "Token security audit (EVM via GoPlus, Solana via RugCheck). "
+            "When OKX keys are configured, POST is gated by x402 "
+            "(0.2 USDT0/call on X Layer, gas-free)."
+        ),
+        "usage": {
+            "contract_address": "0x... (EVM) or base58 (Solana)",
+            "chain": "ethereum|bsc|polygon|arbitrum|optimism|base|avalanche|fantom|solana",
+        },
+        "payment": "POST without payment returns HTTP 402 + PAYMENT-REQUIRED challenge.",
+    }
+
+
 @app.post("/audit", response_model=AuditResponse)
 async def audit_token(
     req: AuditRequest,
@@ -770,6 +794,35 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
             )
         }
         app.middleware("http")(payment_middleware(routes=_routes, server=_resource_server))
+
+        @app.middleware("http")
+        async def _harden_x402_response(request, call_next):
+            """Make the 402 challenge maximally validator-friendly.
+
+            - Re-emit the challenge under the uppercase ``PAYMENT-REQUIRED`` header
+              (some validators match the header name case-sensitively).
+            - Also include the decoded challenge in the JSON *body* (the OKX SDK
+              only sets the header); validators that read the body see it too.
+            """
+            response = await call_next(request)
+            if response.status_code == 402:
+                raw = response.headers.get("payment-required") or response.headers.get(
+                    "PAYMENT-REQUIRED"
+                )
+                if raw:
+                    response.headers["PAYMENT-REQUIRED"] = raw
+                    try:
+                        decoded = base64.b64decode(raw, validate=False).decode("utf-8")
+                        return Response(
+                            content=decoded,
+                            media_type="application/json",
+                            status_code=402,
+                            headers=dict(response.headers),
+                        )
+                    except Exception as e:  # pragma: no cover - defensive
+                        logger.warning("x402: could not decode challenge for body injection: %r", e)
+            return response
+
         logger.info("x402 paid mode ENABLED for POST /audit @ %s/call (X Layer USDT0)", X402_PRICE)
     except Exception as e:  # pragma: no cover - defensive
         logger.exception("x402 init failed; /audit remains free: %s", e)
