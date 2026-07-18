@@ -788,6 +788,30 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
         except Exception:
             pass
 
+        from x402.server_base import x402ResourceServerBase
+
+        # Bulletproof: patch initialize() itself -- the method that calls
+        # facilitator.get_supported() (a blocking sync HTTP call to web3.okx.com
+        # that times out on serverless, causing OKX's "no response / timeout").
+        # Our supported set is static (exact scheme, X Layer eip155:196, USDT0),
+        # so populate the maps directly with no network call. verify/settle
+        # remain real async calls.
+        def _patched_initialize(self):
+            for client in self._facilitator_clients:
+                supported = _STATIC_SUPPORTED
+                for kind in supported.kinds:
+                    network = kind.network
+                    scheme = kind.scheme
+                    self._facilitator_clients_map.setdefault(network, {})
+                    if scheme not in self._facilitator_clients_map[network]:
+                        self._facilitator_clients_map[network][scheme] = client
+                    self._supported_responses.setdefault(network, {})
+                    if scheme not in self._supported_responses[network]:
+                        self._supported_responses[network][scheme] = supported
+            self._initialized = True
+
+        x402ResourceServerBase.initialize = _patched_initialize
+
         _facilitator = OKXFacilitatorClient(
             OKXFacilitatorConfig(
                 auth=OKXAuthConfig(
