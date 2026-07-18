@@ -768,6 +768,7 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
         from fastapi import Response
         from x402.mechanisms.evm.exact.server import ExactEvmScheme
         from x402.schemas import SupportedResponse, SupportedKind
+        import base64, json
 
         # The SDK calls facilitator.get_supported() -- a *synchronous, blocking*
         # HTTP call to web3.okx.com -- while building the 402 challenge. On
@@ -890,9 +891,15 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
                     if _resp is None:
                         return Response(content="Payment required", status_code=402)
                     _b64 = _resp.headers.get("Payment-Required")
+                    if not _b64 and _resp.body is not None:
+                        _body_obj = _resp.body
+                        if hasattr(_body_obj, "model_dump_json"):
+                            _raw = _body_obj.model_dump_json().encode()
+                        else:
+                            _raw = json.dumps(_body_obj, default=str).encode()
+                        _b64 = base64.b64encode(_raw).decode()
                     if not _b64:
-                        import json as _json, base64 as _b64mod
-                        _b64 = _b64mod.b64encode(_json.dumps(_resp.model_dump()).encode()).decode()
+                        return Response(content="Payment required", status_code=402)
                     _hdrs = dict(_resp.headers)
                     _hdrs["PAYMENT-REQUIRED"] = _b64
                     return Response(content=_b64, status_code=_resp.status, headers=_hdrs, media_type="application/json")
