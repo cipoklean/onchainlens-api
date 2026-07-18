@@ -23,7 +23,6 @@ Environment (all optional)
 
 from __future__ import annotations
 
-import base64
 import logging
 import os
 import re
@@ -801,8 +800,10 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
 
             - Re-emit the challenge under the uppercase ``PAYMENT-REQUIRED`` header
               (some validators match the header name case-sensitively).
-            - Also include the decoded challenge in the JSON *body* (the OKX SDK
-              only sets the header); validators that read the body see it too.
+            - Mirror the base64 challenge into the JSON *body* as well. The OKX
+              x402 validator reads + base64-decodes the body, so the body must
+              contain the base64 challenge (the canonical ``Payment-Required``
+              header value), not the decoded JSON.
             """
             response = await call_next(request)
             if response.status_code == 402:
@@ -811,16 +812,12 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
                 )
                 if raw:
                     response.headers["PAYMENT-REQUIRED"] = raw
-                    try:
-                        decoded = base64.b64decode(raw, validate=False).decode("utf-8")
-                        return Response(
-                            content=decoded,
-                            media_type="application/json",
-                            status_code=402,
-                            headers=dict(response.headers),
-                        )
-                    except Exception as e:  # pragma: no cover - defensive
-                        logger.warning("x402: could not decode challenge for body injection: %r", e)
+                    return Response(
+                        content=raw,
+                        media_type="application/json",
+                        status_code=402,
+                        headers=dict(response.headers),
+                    )
             return response
 
         logger.info("x402 paid mode ENABLED for POST /audit @ %s/call (X Layer USDT0)", X402_PRICE)

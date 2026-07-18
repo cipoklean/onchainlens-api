@@ -15,8 +15,10 @@ The verified-payment case is simulated by short-circuiting the SDK's
 REAL SDK so the emitted 402 challenge is genuine.
 """
 import importlib.util
+import json
 import os
 import sys
+import base64
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -132,8 +134,9 @@ def test_x402_unpaid_returns_402_challenge(paid_app, monkeypatch):
         assert "payment-required" in {k.lower() for k in r.headers}
         # Hardening: upper-case header copy.
         assert r.headers.get("PAYMENT-REQUIRED")
-        # Hardening: decoded challenge present in the JSON body.
-        challenge = r.json()
+        # Hardening: base64 challenge mirrored into the body (the OKX validator
+        # base64-decodes the body). Decode it to assert the challenge contents.
+        challenge = json.loads(base64.b64decode(r.text).decode("utf-8"))
         assert challenge["x402Version"] == 2
         assert challenge["accepts"][0]["scheme"] == "exact"
         assert challenge["accepts"][0]["network"] == "eip155:196"
