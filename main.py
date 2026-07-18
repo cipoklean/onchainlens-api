@@ -764,6 +764,29 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
         )
         from x402.http.middleware.fastapi import payment_middleware
         from x402.mechanisms.evm.exact.server import ExactEvmScheme
+        from x402.schemas import SupportedResponse, SupportedKind
+
+        # The SDK calls facilitator.get_supported() -- a *synchronous, blocking*
+        # HTTP call to web3.okx.com -- while building the 402 challenge. On
+        # serverless (Vercel) this blocks the event loop and the request times
+        # out before the 402 is ever returned (this is exactly OKX review reason
+        # #3: "no response / timeout"). Our supported set is static (exact scheme,
+        # X Layer eip155:196, USDT0), so short-circuit it to a constant -- no
+        # network, no blocking call. verify/settle are still real (async) calls.
+        _STATIC_SUPPORTED = SupportedResponse(
+            kinds=[SupportedKind(x402Version=2, scheme="exact", network="eip155:196")]
+        )
+
+        def _static_get_supported(self):
+            return _STATIC_SUPPORTED
+
+        OKXFacilitatorClient.get_supported = _static_get_supported
+        try:  # sync variant may or may not be present in this SDK build
+            from x402.http.okx_facilitator_client import OKXFacilitatorClientSync
+
+            OKXFacilitatorClientSync.get_supported = _static_get_supported
+        except Exception:
+            pass
 
         _facilitator = OKXFacilitatorClient(
             OKXFacilitatorConfig(
