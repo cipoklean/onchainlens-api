@@ -762,7 +762,10 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
             RouteConfig,
             PaymentOption,
         )
-        from x402.http.middleware.fastapi import payment_middleware
+        from x402.http.middleware.fastapi import FastAPIAdapter, _facilitator_error_response
+        from x402.http.types import HTTPRequestContext
+        from x402.http.x402_http_server import x402HTTPResourceServer as _X402HTTPServer
+        from fastapi import Response
         from x402.mechanisms.evm.exact.server import ExactEvmScheme
         from x402.schemas import SupportedResponse, SupportedKind
 
@@ -824,6 +827,16 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
         )
         _resource_server = x402ResourceServer(_facilitator)
         _resource_server.register("eip155:196", ExactEvmScheme())
+
+        # Instance-level patch: the SDK may wrap the facilitator, so the class
+        # patch above can miss the actual object initialize() loops over. Patch
+        # every client instance directly -> no blocking get_supported() network
+        # call (our supported set is static).
+        for _c in getattr(_resource_server, "_facilitator_clients", []) or []:
+            try:
+                _c.get_supported = _static_get_supported
+            except Exception:
+                pass
         _routes = {
             "POST /audit": RouteConfig(
                 accepts=[
@@ -839,38 +852,74 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
                 mime_type="application/json",
             )
         }
-        def _make_x402_middleware():
-            """Wrap the SDK payment middleware so the 402 carries the base64
-            challenge in BOTH the (uppercase) PAYMENT-REQUIRED header and the
-            JSON *body*. The OKX x402 validator reads + base64-decodes the body,
-            so the body must contain the *raw* base64 challenge -- not the decoded
-            JSON (JSONResponse would quote it into "eyJ...") and not an empty body.
-
-            Done by wrapping payment_middleware directly (not via a separate outer
-            middleware) to avoid nested BaseHTTPMiddleware header-propagation
-            quirks that bite on serverless (Vercel/uvicorn) runtimes.
+        def _okx_payment_middleware(routes, server, exempt_payers=None, sync_facilitator_on_start=True):
+            """Drop-in for x402's payment_middleware. Returns the 402 challenge as a
+            RAW base64 body (what the OKX x402 validator expects) instead of the
+            SDK's JSON-quoted ``{}``. Reuses the SDK's process_http_request so
+            verify/settle still work. Single BaseHTTPMiddleware (no nesting) so
+            custom headers survive on Vercel/uvicorn.
             """
-            _inner = payment_middleware(routes=_routes, server=_resource_server)
+            _http_server = _X402HTTPServer(server, routes, exempt_payers=exempt_payers)
+            _init_done = False
 
             async def _mw(request, call_next):
-                resp = await _inner(request, call_next)
-                if resp.status_code == 402:
-                    raw = resp.headers.get("Payment-Required")
-                    if raw:
-                        new = Response(
-                            content=raw,
-                            media_type="application/json",
-                            status_code=402,
-                        )
-                        for k, v in resp.headers.items():
-                            new.headers[k] = v
-                        new.headers["PAYMENT-REQUIRED"] = raw
-                        return new
-                return resp
+                nonlocal _init_done
+                _adapter = FastAPIAdapter(request)
+                _ctx = HTTPRequestContext(
+                    adapter=_adapter,
+                    path=request.url.path,
+                    method=request.method,
+                    payment_header=(_adapter.get_header("payment-signature") or _adapter.get_header("x-payment")),
+                )
+                if not _http_server.requires_payment(_ctx):
+                    return await call_next(request)
+                if sync_facilitator_on_start and not _init_done:
+                    try:
+                        _http_server.initialize()
+                    except FacilitatorResponseError as _err:
+                        return _facilitator_error_response(_err)
+                    _init_done = True
+                try:
+                    _result = await _http_server.process_http_request(_ctx, None)
+                except FacilitatorResponseError as _err:
+                    return _facilitator_error_response(_err)
+                if _result.type == "no-payment-required":
+                    return await call_next(request)
+                if _result.type == "payment-error":
+                    _resp = _result.response
+                    if _resp is None:
+                        return Response(content="Payment required", status_code=402)
+                    _b64 = _resp.headers.get("Payment-Required")
+                    if not _b64:
+                        import json as _json, base64 as _b64mod
+                        _b64 = _b64mod.b64encode(_json.dumps(_resp.model_dump()).encode()).decode()
+                    _hdrs = dict(_resp.headers)
+                    _hdrs["PAYMENT-REQUIRED"] = _b64
+                    return Response(content=_b64, status_code=_resp.status, headers=_hdrs, media_type="application/json")
+                if _result.type == "payment-verified":
+                    request.state.payment_payload = _result.payment_payload
+                    request.state.payment_requirements = _result.payment_requirements
+                    _resp = await call_next(request)
+                    if _resp.status_code >= 400:
+                        return _resp
+                    _body = b""
+                    async for _chunk in _resp.body_iterator:
+                        _body += _chunk
+                    try:
+                        _settle = await _http_server.process_settlement(_result.payment_payload, _result.payment_requirements, context=_ctx)
+                        if not _settle.success:
+                            _sr = _settle.response
+                            if _sr is None:
+                                return Response(content="", status_code=402)
+                            return Response(content=_sr.body or "", status_code=_sr.status, headers=dict(_sr.headers))
+                    except Exception:
+                        pass
+                    return Response(content=_body, status_code=_resp.status_code, headers=dict(_resp.headers), media_type=_resp.media_type)
+                return await call_next(request)
 
             return _mw
 
-        app.middleware("http")(_make_x402_middleware())
+        app.middleware("http")(_okx_payment_middleware(routes=_routes, server=_resource_server))
 
         logger.info("x402 paid mode ENABLED for POST /audit @ %s/call (X Layer USDT0)", X402_PRICE)
     except Exception as e:  # pragma: no cover - defensive
