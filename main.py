@@ -815,33 +815,38 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
                 mime_type="application/json",
             )
         }
-        app.middleware("http")(payment_middleware(routes=_routes, server=_resource_server))
+        def _make_x402_middleware():
+            """Wrap the SDK payment middleware so the 402 carries the base64
+            challenge in BOTH the (uppercase) PAYMENT-REQUIRED header and the
+            JSON *body*. The OKX x402 validator reads + base64-decodes the body,
+            so the body must contain the *raw* base64 challenge -- not the decoded
+            JSON (JSONResponse would quote it into "eyJ...") and not an empty body.
 
-        @app.middleware("http")
-        async def _harden_x402_response(request, call_next):
-            """Make the 402 challenge maximally validator-friendly.
-
-            - Re-emit the challenge under the uppercase ``PAYMENT-REQUIRED`` header
-              (some validators match the header name case-sensitively).
-            - Mirror the base64 challenge into the JSON *body* as well. The OKX
-              x402 validator reads + base64-decodes the body, so the body must
-              contain the base64 challenge (the canonical ``Payment-Required``
-              header value), not the decoded JSON.
+            Done by wrapping payment_middleware directly (not via a separate outer
+            middleware) to avoid nested BaseHTTPMiddleware header-propagation
+            quirks that bite on serverless (Vercel/uvicorn) runtimes.
             """
-            response = await call_next(request)
-            if response.status_code == 402:
-                raw = response.headers.get("payment-required") or response.headers.get(
-                    "PAYMENT-REQUIRED"
-                )
-                if raw:
-                    response.headers["PAYMENT-REQUIRED"] = raw
-                    return Response(
-                        content=raw,
-                        media_type="application/json",
-                        status_code=402,
-                        headers=dict(response.headers),
-                    )
-            return response
+            _inner = payment_middleware(routes=_routes, server=_resource_server)
+
+            async def _mw(request, call_next):
+                resp = await _inner(request, call_next)
+                if resp.status_code == 402:
+                    raw = resp.headers.get("Payment-Required")
+                    if raw:
+                        new = Response(
+                            content=raw,
+                            media_type="application/json",
+                            status_code=402,
+                        )
+                        for k, v in resp.headers.items():
+                            new.headers[k] = v
+                        new.headers["PAYMENT-REQUIRED"] = raw
+                        return new
+                return resp
+
+            return _mw
+
+        app.middleware("http")(_make_x402_middleware())
 
         logger.info("x402 paid mode ENABLED for POST /audit @ %s/call (X Layer USDT0)", X402_PRICE)
     except Exception as e:  # pragma: no cover - defensive
