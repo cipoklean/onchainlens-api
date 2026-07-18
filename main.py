@@ -890,14 +890,26 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
                     _resp = _result.response
                     if _resp is None:
                         return Response(content="Payment required", status_code=402)
-                    _b64 = _resp.headers.get("Payment-Required")
+                    # The SDK puts the base64 challenge in the PAYMENT-REQUIRED
+                    # header; HTTPResponseInstructions.body is intentionally {}.
+                    _b64 = (
+                        _resp.headers.get("PAYMENT-REQUIRED")
+                        or _resp.headers.get("Payment-Required")
+                        or _resp.headers.get("payment-required")
+                    )
+                    if not _b64 and _result.payment_requirements is not None:
+                        try:
+                            _challenge = _resource_server.create_payment_required_response(
+                                [_result.payment_requirements], None
+                            )
+                            _b64 = base64.b64encode(_challenge.model_dump_json().encode()).decode()
+                        except Exception:
+                            _b64 = None
                     if not _b64 and _resp.body is not None:
-                        _body_obj = _resp.body
-                        if hasattr(_body_obj, "model_dump_json"):
-                            _raw = _body_obj.model_dump_json().encode()
-                        else:
-                            _raw = json.dumps(_body_obj, default=str).encode()
-                        _b64 = base64.b64encode(_raw).decode()
+                        try:
+                            _b64 = base64.b64encode(json.dumps(_resp.body, default=str).encode()).decode()
+                        except Exception:
+                            _b64 = None
                     if not _b64:
                         return Response(content="Payment required", status_code=402)
                     _hdrs = dict(_resp.headers)
