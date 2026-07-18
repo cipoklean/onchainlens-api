@@ -20,7 +20,7 @@ liquidity lock, mint/freeze authority, and more).
 ### Example
 
 ```bash
-curl -X POST https://your-app.onrender.com/audit \
+curl -X POST https://your-app.vercel.app/audit \
   -H "Content-Type: application/json" \
   -d '{"contract_address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "chain": "ethereum"}'
 ```
