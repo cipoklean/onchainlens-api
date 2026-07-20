@@ -890,8 +890,9 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
                     _resp = _result.response
                     if _resp is None:
                         return Response(content="Payment required", status_code=402)
-                    # The SDK puts the base64 challenge in the PAYMENT-REQUIRED
-                    # header; HTTPResponseInstructions.body is intentionally {}.
+                    # The SDK puts the base64 challenge in the Payment-Required
+                    # header (mixed case by default); HTTPResponseInstructions.body
+                    # is intentionally {}.
                     _b64 = (
                         _resp.headers.get("PAYMENT-REQUIRED")
                         or _resp.headers.get("Payment-Required")
@@ -913,6 +914,14 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
                     if not _b64:
                         return Response(content="Payment required", status_code=402)
                     _hdrs = dict(_resp.headers)
+                    # CRITICAL: drop EVERY case-variant of the payment-required
+                    # header. Vercel collapses case-insensitive duplicate headers
+                    # and would otherwise keep the SDK's mixed-case
+                    # 'Payment-Required', which OKX's review rejects as "not a
+                    # standard 402 challenge". Leaving only the uppercase
+                    # PAYMENT-REQUIRED makes the challenge validate.
+                    for _k in [k for k in _hdrs if k.lower() == "payment-required"]:
+                        del _hdrs[_k]
                     _hdrs["PAYMENT-REQUIRED"] = _b64
                     return Response(content=_b64, status_code=_resp.status, headers=_hdrs, media_type="application/json")
                 if _result.type == "payment-verified":
