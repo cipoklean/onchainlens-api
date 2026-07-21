@@ -9,6 +9,12 @@ liquidity lock, mint/freeze authority, and more).
 - **Solana** — scanned via [RugCheck](https://rugcheck.xyz/) (GoPlus does NOT
   support Solana, so a dedicated Solana source is used).
 
+## Hosts
+
+- **Canonical:** `https://onchainlens.dpdns.org` — use this one.
+- **Legacy:** `https://onchainlens-api.vercel.app` — kept for backward compatibility. Note: some buyer/agent security policies block `vercel.app` (deploy-platform host); they should use the canonical host.
+- A second custom-domain mirror is planned. Exact hostnames are documented here so policy-restricted buyers can pre-clear them with their security tooling.
+
 ## Endpoints
 
 | Method | Path    | Body                                  | Notes                          |
@@ -20,7 +26,7 @@ liquidity lock, mint/freeze authority, and more).
 ### Example
 
 ```bash
-curl -X POST https://your-app.vercel.app/audit \
+curl -X POST https://onchainlens.dpdns.org/audit \
   -H "Content-Type: application/json" \
   -d '{"contract_address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "chain": "ethereum"}'
 ```

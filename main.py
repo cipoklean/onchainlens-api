@@ -655,6 +655,8 @@ async def audit_info():
     return {
         "service": "OnchainLens",
         "endpoint": "POST /audit",
+        "canonical_endpoint": "https://onchainlens.dpdns.org/audit",
+        "mirror_endpoints": ["https://onchainlens-api.vercel.app/audit"],
         "description": (
             "Token security audit (EVM via GoPlus, Solana via RugCheck). "
             "When OKX keys are configured, POST is gated by x402 "
@@ -763,12 +765,14 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
             PaymentOption,
         )
         from x402.http.middleware.fastapi import FastAPIAdapter, _facilitator_error_response
+        from x402.http.facilitator_client_base import FacilitatorResponseError
         from x402.http.types import HTTPRequestContext
         from x402.http.x402_http_server import x402HTTPResourceServer as _X402HTTPServer
         from fastapi import Response
         from x402.mechanisms.evm.exact.server import ExactEvmScheme
         from x402.schemas import SupportedResponse, SupportedKind
-        import base64, json
+        import base64
+        import json
 
         # The SDK calls facilitator.get_supported() -- a *synchronous, blocking*
         # HTTP call to web3.okx.com -- while building the 402 challenge. On
