@@ -23,6 +23,7 @@ Environment (all optional)
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -46,6 +47,7 @@ API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
 CACHE_TTL = int(os.getenv("CACHE_TTL", "120"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "60"))
+RATE_LIMIT_MAX_IPS = 10_000  # max tracked IPs before stale-entry pruning
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
@@ -104,18 +106,21 @@ async def lifespan(app: FastAPI):
 
 def get_client() -> httpx.AsyncClient:
     if HTTP_CLIENT is None:
-        # Defensive fallback (e.g. tests) — should not happen in normal runtime.
-        return httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+        raise RuntimeError(
+            "HTTP client not initialised — app lifespan did not run. "
+            "Use TestClient(app) or start the app properly."
+        )
     return HTTP_CLIENT
 
 
-# ── In-memory TTL cache ───────────────────────────────────────────────────────
+# ── In-memory TTL cache (bounded, async-safe) ────────────────────────────────
+CACHE_MAX_SIZE = 2048  # max entries before oldest-eviction
 _cache: dict[str, tuple[float, Any]] = {}
-_cache_lock = threading.Lock()
+_cache_lock = asyncio.Lock()
 
 
 async def cache_get(key: str) -> Optional[Any]:
-    with _cache_lock:
+    async with _cache_lock:
         item = _cache.get(key)
         if item and item[0] > time.time():
             return item[1]
@@ -124,8 +129,18 @@ async def cache_get(key: str) -> Optional[Any]:
 
 
 async def cache_set(key: str, value: Any, ttl: int) -> None:
-    with _cache_lock:
+    async with _cache_lock:
         _cache[key] = (time.time() + ttl, value)
+        # Evict expired + oldest entries when over capacity.
+        if len(_cache) > CACHE_MAX_SIZE:
+            now = time.time()
+            expired = [k for k, (exp, _) in _cache.items() if exp <= now]
+            for k in expired:
+                del _cache[k]
+            if len(_cache) > CACHE_MAX_SIZE:
+                oldest = sorted(_cache, key=lambda k: _cache[k][0])
+                for k in oldest[: len(_cache) - CACHE_MAX_SIZE]:
+                    del _cache[k]
 
 
 # ── In-memory per-IP rate limiter (fixed window) ─────────────────────────────
@@ -133,10 +148,18 @@ _rl: dict[str, list[float]] = {}
 _rl_lock = threading.Lock()
 
 
+def _client_ip(request: Request) -> str:
+    """Real client IP, respecting reverse-proxy headers (Vercel, nginx, etc.)."""
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def rate_limit(request: Request) -> None:
     if RATE_LIMIT <= 0:
         return
-    ip = request.client.host if request.client else "unknown"
+    ip = _client_ip(request)
     now = time.time()
     with _rl_lock:
         hits = _rl.get(ip, [])
@@ -147,6 +170,11 @@ def rate_limit(request: Request) -> None:
             raise HTTPException(429, "Rate limit exceeded. Please retry later.")
         hits.append(now)
         _rl[ip] = hits
+        # Prune stale IPs to bound memory (keep dict from growing forever).
+        if len(_rl) > RATE_LIMIT_MAX_IPS:
+            stale = [k for k, v in _rl.items() if not v or v[-1] < now - 120]
+            for k in stale:
+                del _rl[k]
 
 
 # ── Auth dependency ───────────────────────────────────────────────────────────
@@ -174,7 +202,7 @@ class TokenNotFoundError(Exception):
 # ── Pydantic models ─────────────────────────────────────────────────────────────
 class AuditRequest(BaseModel):
     contract_address: str = Field(
-        ..., description="Token contract address (0x... for EVM, base58 for Solana)"
+        ..., max_length=64, description="Token contract address (0x... for EVM, base58 for Solana)"
     )
     chain: str = Field(
         default="ethereum",
@@ -284,8 +312,18 @@ async def scan_rugcheck(address: str) -> dict:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    """Parse a float from upstream data without crashing on junk values."""
+    if v in (None, ""):
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _truthy(v: Any) -> bool:
-    return v in ("1", 1, True, "true", "True")
+    return v in ("1", 1, True, "true", "True", "TRUE", "yes", "Yes")
 
 
 def _tax_str(raw: Any) -> Optional[str]:
@@ -337,8 +375,8 @@ def assess_goplus(tok: dict) -> dict:
             "findings": findings,
         }
 
-    buy_tax = float(tok.get("buy_tax") or 0) or 0.0
-    sell_tax = float(tok.get("sell_tax") or 0) or 0.0
+    buy_tax = _safe_float(tok.get("buy_tax"))
+    sell_tax = _safe_float(tok.get("sell_tax"))
 
     if sell_tax > 50:
         findings.append(AuditFinding(
@@ -625,6 +663,21 @@ app.add_middleware(
 )
 if CORS_ORIGINS.strip() == "*":
     logger.warning("CORS is open to all origins (*). Set CORS_ORIGINS for production.")
+
+MAX_BODY_BYTES = 64 * 1024  # 64 KB — audit requests are < 200 bytes
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    # Reject oversized bodies before they are parsed into memory.
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
+        return Response(content="Request body too large", status_code=413)
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return response
 
 
 @app.get("/")
@@ -945,7 +998,7 @@ if OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE:
                                 return Response(content="", status_code=402)
                             return Response(content=_sr.body or "", status_code=_sr.status, headers=dict(_sr.headers))
                     except Exception:
-                        pass
+                        logger.exception("x402 settlement failed after successful verify")
                     return Response(content=_body, status_code=_resp.status_code, headers=dict(_resp.headers), media_type=_resp.media_type)
                 return await call_next(request)
 
